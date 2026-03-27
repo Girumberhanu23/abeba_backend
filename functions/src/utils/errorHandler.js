@@ -32,6 +32,7 @@ const errorHandler = (err, req, res, _next) => {
     status: "error",
     statusCode,
     message,
+    reply: message,
   });
 };
 
