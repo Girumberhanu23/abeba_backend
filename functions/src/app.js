@@ -23,8 +23,14 @@ app.use(express.urlencoded({ extended: true }));
 // Request logging
 app.use(requestLogger);
 
+// Debug: log every incoming request immediately
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 // --------------- Routes ---------------
-app.use("/", routes);
+app.use("/v1", routes);
 
 // --------------- Error Handling ---------------
 // 404 handler — must come after all routes
@@ -32,5 +38,18 @@ app.use(notFoundHandler);
 
 // Global error handler — must be last middleware
 app.use(errorHandler);
+
+// --------------- Debug: print registered routes ---------------
+app._router.stack.forEach((middleware) => {
+  if (middleware.route) {
+    console.log("ROUTE:", middleware.route.path);
+  } else if (middleware.name === "router") {
+    middleware.handle.stack.forEach((handler) => {
+      if (handler.route) {
+        console.log("ROUTE:", handler.route.path);
+      }
+    });
+  }
+});
 
 module.exports = app;

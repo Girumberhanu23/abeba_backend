@@ -1,7 +1,7 @@
 const { AppError } = require("./errorHandler");
 
 const MAX_MESSAGE_LENGTH = 1500;
-const MAX_HISTORY_LENGTH = 10;
+const MAX_HISTORY_LENGTH = 8;
 const VALID_ROLES = new Set(["user", "assistant"]);
 
 /**

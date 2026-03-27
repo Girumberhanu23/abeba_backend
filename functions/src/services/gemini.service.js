@@ -1,7 +1,7 @@
 const { getEnv } = require("../utils/env");
-const { AppError } = require("../utils/errorHandler");
 
-const GEMINI_MODEL = "gemini-2.0-flash";
+const PRIMARY_MODEL = "gemini-2.0-flash";
+const FALLBACK_MODEL = "gemini-2.0-flash-lite";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_MESSAGE_LENGTH = 2000;
@@ -26,63 +26,62 @@ STRICT RULES:
 7. When unsure, say so honestly rather than guessing.
 8. Respect cultural sensitivities around reproductive health topics.`;
 
+const STATIC_FALLBACK_REPLY =
+  "I'm having trouble accessing the assistant right now. " +
+  "Generally, signs of ovulation may include changes in cervical mucus, " +
+  "slight increases in basal body temperature, and mild pelvic discomfort. " +
+  "For personalized advice, please consult a healthcare professional.";
+
 /**
  * Call the Gemini generateContent endpoint with timeout + retry.
+ * Retries once on 429, 5xx, or timeout. Returns parsed JSON on success.
  */
-const callGeminiAPI = async (url, body, retriesLeft = MAX_RETRIES) => {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+const callGeminiAPI = async (model, body, maxRetries = MAX_RETRIES) => {
+  const apiKey = getEnv("GEMINI_API_KEY", { required: true });
+  const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${apiKey}`;
+  let lastError;
 
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    if (!response.ok) {
-      if (response.status === 429) {
-        throw new AppError(
-          "The AI service is temporarily busy. Please try again in a few seconds.",
-          429,
-        );
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        const err = new Error(`Gemini API error (${response.status}): ${errorBody}`);
+        err.statusCode = response.status;
+        throw err;
       }
-      const errorBody = await response.text();
-      throw new AppError(
-        `Gemini API error (${response.status}): ${errorBody}`,
-        502,
-      );
-    }
 
-    return await response.json();
-  } catch (err) {
-    if (err.name === "AbortError") {
-      if (retriesLeft > 0) {
-        return callGeminiAPI(url, body, retriesLeft - 1);
+      return await response.json();
+    } catch (err) {
+      lastError = err;
+      const isRetryable =
+        err.name === "AbortError" ||
+        (err.statusCode && (err.statusCode === 429 || err.statusCode >= 500));
+
+      if (isRetryable && attempt < maxRetries) {
+        console.warn(`[GEMINI] Attempt ${attempt + 1} failed for ${model}, retrying...`);
+        continue;
       }
-      throw new AppError("Gemini API request timed out", 504);
+      break;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    if (err instanceof AppError) {
-      // Never retry on rate limit — it wastes quota
-      if (retriesLeft > 0 && err.statusCode === 502) {
-        return callGeminiAPI(url, body, retriesLeft - 1);
-      }
-      throw err;
-    }
-
-    throw new AppError("Failed to reach Gemini API", 502);
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError;
 };
 
 /**
  * Build the contents array expected by the Gemini API.
- *
- * @param {string} message  – current user message
- * @param {Array}  history  – optional prior turns [{role, text}]
  */
 const buildContents = (message, history = []) => {
   const contents = [];
@@ -108,51 +107,69 @@ const buildContents = (message, history = []) => {
 const parseResponse = (data) => {
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
-    throw new AppError("Gemini returned an empty or invalid response", 502);
+    throw new Error("Gemini returned an empty or invalid response");
   }
   return text.trim();
 };
 
 /**
- * Send a message to Gemini and return the assistant's reply.
+ * Build the request body shared by both primary and fallback models.
+ */
+const buildRequestBody = (message, history) => ({
+  system_instruction: {
+    parts: [{ text: SYSTEM_PROMPT }],
+  },
+  contents: buildContents(message, history),
+  generationConfig: {
+    temperature: 0.7,
+    topP: 0.9,
+    maxOutputTokens: 1024,
+  },
+  safetySettings: [
+    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+  ],
+});
+
+/**
+ * Send a message to Gemini with multi-model fallback.
+ *
+ * Flow:
+ * 1. Try primary model (gemini-2.0-flash) with 1 retry
+ * 2. If that fails → try fallback model (gemini-1.5-flash), no retry
+ * 3. If both fail → return a safe static fallback reply
  *
  * @param {Object}  params
  * @param {string}  params.message – user input (required)
  * @param {Array}   [params.history] – previous conversation turns
- * @returns {Promise<{reply: string}>}
+ * @returns {Promise<{reply: string, model: string|null, fallback: boolean, source: string}>}
  */
 const sendMessage = async ({ message, history = [] }) => {
-  if (!message || typeof message !== "string" || message.trim().length === 0) {
-    throw new AppError("Message cannot be empty", 400);
+  const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
+  const body = buildRequestBody(trimmed, history);
+
+  // 1) Try primary model with retry
+  try {
+    const data = await callGeminiAPI(PRIMARY_MODEL, body, MAX_RETRIES);
+    const reply = parseResponse(data);
+    return { reply, model: PRIMARY_MODEL, fallback: false, source: "ai" };
+  } catch (primaryErr) {
+    console.warn(`[GEMINI] Primary model (${PRIMARY_MODEL}) failed: ${primaryErr.message}`);
   }
 
-  const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
+  // 2) Try fallback model — no retries
+  try {
+    const data = await callGeminiAPI(FALLBACK_MODEL, body, 0);
+    const reply = parseResponse(data);
+    return { reply, model: FALLBACK_MODEL, fallback: true, source: "ai" };
+  } catch (fallbackErr) {
+    console.error(`[GEMINI] Fallback model (${FALLBACK_MODEL}) also failed: ${fallbackErr.message}`);
+  }
 
-  const apiKey = getEnv("GEMINI_API_KEY", { required: true });
-  const url = `${GEMINI_BASE_URL}/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
-
-  const body = {
-    system_instruction: {
-      parts: [{ text: SYSTEM_PROMPT }],
-    },
-    contents: buildContents(trimmed, history),
-    generationConfig: {
-      temperature: 0.7,
-      topP: 0.9,
-      maxOutputTokens: 1024,
-    },
-    safetySettings: [
-      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-    ],
-  };
-
-  const data = await callGeminiAPI(url, body);
-  const reply = parseResponse(data);
-
-  return { reply };
+  // 3) Both models failed — return controlled static response
+  return { reply: STATIC_FALLBACK_REPLY, model: null, fallback: true, source: "static" };
 };
 
-module.exports = { sendMessage };
+module.exports = { sendMessage, STATIC_FALLBACK_REPLY };
